@@ -1,0 +1,4 @@
+fastapi
+uvicorn[standard]
+databricks-sql-connector
+python-dotenv
