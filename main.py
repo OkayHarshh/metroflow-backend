@@ -1,5 +1,7 @@
 import os
 import heapq
+import time
+from threading import Lock
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -423,68 +425,91 @@ def find_multiple_routes(
 
 
 # ============================================================
-# CROWD DATA
+# CROWD DATA CACHE
 # ============================================================
 
-def get_crowd_for_route(
-    station_ids,
-    departure_hour
-):
+# The serving table is small (~5K rows), so load it once and filter
+# in memory instead of opening a Databricks connection for each route.
+# Cache refreshes every 5 minutes.
+CROWD_CACHE_TTL_SECONDS = 300
+_crowd_cache = None
+_crowd_cache_loaded_at = 0.0
+_crowd_cache_lock = Lock()
 
+
+def load_crowd_cache(force_refresh=False):
+    global _crowd_cache, _crowd_cache_loaded_at
+
+    now = time.monotonic()
+    cache_is_fresh = (
+        _crowd_cache is not None
+        and now - _crowd_cache_loaded_at < CROWD_CACHE_TTL_SECONDS
+    )
+    if cache_is_fresh and not force_refresh:
+        return _crowd_cache
+
+    with _crowd_cache_lock:
+        now = time.monotonic()
+        cache_is_fresh = (
+            _crowd_cache is not None
+            and now - _crowd_cache_loaded_at < CROWD_CACHE_TTL_SECONDS
+        )
+        if cache_is_fresh and not force_refresh:
+            return _crowd_cache
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT
+                    station_id,
+                    station_name,
+                    hour,
+                    scheduled_train_visits,
+                    activity_level,
+                    crowd_score,
+                    crowd_level,
+                    seat_likelihood_pct
+                FROM workspace.metroflow_gold.gold_crowd_serving
+            """)
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
+
+        cache = {}
+        for row in rows:
+            station_id = str(row[0])
+            hour = int(row[2])
+            cache[(station_id, hour)] = {
+                "station_id": station_id,
+                "station_name": row[1],
+                "hour": hour,
+                "scheduled_train_visits": row[3],
+                "activity_level": row[4],
+                "crowd_score": float(row[5]),
+                "crowd_level": row[6],
+                "estimated_seat_likelihood_pct": float(row[7]),
+            }
+
+        _crowd_cache = cache
+        _crowd_cache_loaded_at = time.monotonic()
+        return _crowd_cache
+
+
+def get_crowd_for_route(station_ids, departure_hour):
     if not station_ids:
         return []
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    placeholders = ",".join(
-        ["?"] * len(station_ids)
-    )
-
-    query = f"""
-        SELECT
-            station_id,
-            station_name,
-            hour,
-            scheduled_train_visits,
-            activity_level,
-            crowd_score,
-            crowd_level,
-            seat_likelihood_pct
-        FROM workspace.metroflow_gold.gold_crowd_serving
-        WHERE hour = ?
-        AND station_id IN ({placeholders})
-    """
-
-    params = [
-        departure_hour
-    ] + station_ids
-
-    cursor.execute(
-        query,
-        params
-    )
-
-    rows = cursor.fetchall()
-
-    cursor.close()
-    conn.close()
-
+    cache = load_crowd_cache()
+    # Preserve the route's station order for predictable API responses.
     result = []
-
-    for row in rows:
-
-        result.append({
-            "station_id": str(row[0]),
-            "station_name": row[1],
-            "hour": row[2],
-            "scheduled_train_visits": row[3],
-            "activity_level": row[4],
-            "crowd_score": float(row[5]),
-            "crowd_level": row[6],
-            "estimated_seat_likelihood_pct": float(row[7])
-        })
-
+    seen = set()
+    for station_id in station_ids:
+        key = (str(station_id), int(departure_hour))
+        if key in cache and key not in seen:
+            result.append(cache[key])
+            seen.add(key)
     return result
 
 
@@ -787,47 +812,37 @@ def crowd(
     hour: int
 ):
 
-    conn = get_connection()
-    cursor = conn.cursor()
+    if hour < 0 or hour > 25:
+        raise HTTPException(
+            status_code=400,
+            detail="Hour must be between 0 and 25"
+        )
 
-    cursor.execute("""
-        SELECT
-            station_name,
-            hour,
-            scheduled_train_visits,
-            activity_level,
-            crowd_score,
-            crowd_level,
-            seat_likelihood_pct
-        FROM workspace.metroflow_gold.gold_crowd_serving
-        WHERE LOWER(station_name) = LOWER(?)
-        AND hour = ?
-    """, (
-        station,
-        hour
-    ))
+    cache = load_crowd_cache()
+    station_key = station.strip().lower()
+    row = next(
+        (
+            item for item in cache.values()
+            if item["station_name"].strip().lower() == station_key
+            and item["hour"] == hour
+        ),
+        None
+    )
 
-    row = cursor.fetchone()
-
-    cursor.close()
-    conn.close()
-
-    if not row:
-
+    if row is None:
         raise HTTPException(
             status_code=404,
             detail="Crowd data not found"
         )
 
     return {
-        "station": row[0],
-        "hour": row[1],
-        "scheduled_train_visits": row[2],
-        "activity_level": row[3],
-        "crowd_score": row[4],
-        "crowd_level": row[5],
-        "estimated_seat_likelihood_pct":
-            row[6]
+        "station": row["station_name"],
+        "hour": row["hour"],
+        "scheduled_train_visits": row["scheduled_train_visits"],
+        "activity_level": row["activity_level"],
+        "crowd_score": row["crowd_score"],
+        "crowd_level": row["crowd_level"],
+        "estimated_seat_likelihood_pct": row["estimated_seat_likelihood_pct"]
     }
 
 
