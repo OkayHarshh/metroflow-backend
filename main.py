@@ -1,9 +1,10 @@
 import os
+import csv
 import heapq
 import time
-from threading import Lock
-import csv
+import threading
 
+from threading import Lock
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -19,7 +20,7 @@ load_dotenv()
 app = FastAPI(
     title="MetroFlow API",
     description="Smart Crowd-Aware Delhi Metro Journey Planner",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -32,15 +33,170 @@ app.add_middleware(
 
 
 # ============================================================
-# DATABRICKS CONNECTION
+# DATABRICKS CONFIG
 # ============================================================
 
+DATABRICKS_RETRIES = 3
+DATABRICKS_RETRY_DELAY = 2
+
+
 def get_connection():
+    hostname = os.getenv("DATABRICKS_SERVER_HOSTNAME")
+    http_path = os.getenv("DATABRICKS_HTTP_PATH")
+    token = os.getenv("DATABRICKS_TOKEN")
+
+    if not hostname or not http_path or not token:
+        raise RuntimeError(
+            "Databricks environment variables are missing"
+        )
+
     return sql.connect(
-        server_hostname=os.getenv("DATABRICKS_SERVER_HOSTNAME"),
-        http_path=os.getenv("DATABRICKS_HTTP_PATH"),
-        access_token=os.getenv("DATABRICKS_TOKEN")
+        server_hostname=hostname,
+        http_path=http_path,
+        access_token=token
     )
+
+
+def execute_databricks_query(query):
+    """
+    Executes a Databricks query with retries.
+    Temporary Databricks failures won't immediately
+    break the user request.
+    """
+
+    last_error = None
+
+    for attempt in range(1, DATABRICKS_RETRIES + 1):
+
+        conn = None
+        cursor = None
+
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute(query)
+            rows = cursor.fetchall()
+
+            return rows
+
+        except Exception as e:
+            last_error = e
+
+            print(
+                f"Databricks attempt "
+                f"{attempt}/{DATABRICKS_RETRIES} failed: {e}"
+            )
+
+            if attempt < DATABRICKS_RETRIES:
+                time.sleep(
+                    DATABRICKS_RETRY_DELAY * attempt
+                )
+
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    raise RuntimeError(
+        f"Databricks request failed after "
+        f"{DATABRICKS_RETRIES} attempts: {last_error}"
+    )
+
+
+# ============================================================
+# LOCAL STATION DATA
+# ============================================================
+
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
+
+STATIONS_FILE = os.path.join(
+    BASE_DIR,
+    "dim_station.csv"
+)
+
+local_stations = []
+local_station_lookup = {}
+_local_stations_lock = Lock()
+
+
+def load_local_stations():
+
+    global local_stations
+    global local_station_lookup
+
+    if local_stations:
+        return
+
+    with _local_stations_lock:
+
+        # Double-check after acquiring lock
+        if local_stations:
+            return
+
+        try:
+
+            stations = []
+            lookup = {}
+
+            with open(
+                STATIONS_FILE,
+                mode="r",
+                encoding="utf-8-sig"
+            ) as file:
+
+                reader = csv.DictReader(file)
+
+                for row in reader:
+
+                    station_name = (
+                        row.get("station_name") or ""
+                    ).strip()
+
+                    station_id = (
+                        row.get("station_id") or ""
+                    ).strip()
+
+                    if station_name:
+
+                        stations.append(
+                            station_name
+                        )
+
+                        lookup[
+                            station_name.lower()
+                        ] = station_id
+
+            # Remove duplicates and sort
+            local_stations = sorted(
+                list(set(stations)),
+                key=lambda x: x.lower()
+            )
+
+            local_station_lookup = lookup
+
+            print(
+                f"Loaded "
+                f"{len(local_stations)} stations "
+                f"from local CSV"
+            )
+
+        except FileNotFoundError:
+
+            raise RuntimeError(
+                f"Station file not found: "
+                f"{STATIONS_FILE}"
+            )
 
 
 # ============================================================
@@ -51,115 +207,89 @@ metro_graph = None
 station_names = None
 station_lookup = None
 
-# ============================================================
-# LOCAL STATION DATA
-# ============================================================
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIONS_FILE = os.path.join(BASE_DIR, "dim_station.csv")
-
-local_stations = []
-local_station_lookup = {}
+_network_lock = Lock()
 
 
-def load_local_stations():
-    global local_stations
-    global local_station_lookup
-
-    # Already loaded in memory
-    if local_stations:
-        return
-
-    try:
-        with open(
-            STATIONS_FILE,
-            mode="r",
-            encoding="utf-8-sig"
-        ) as file:
-
-            reader = csv.DictReader(file)
-
-            for row in reader:
-                station_name = row["station_name"].strip()
-
-                if station_name:
-                    local_stations.append(station_name)
-
-                    local_station_lookup[
-                        station_name.lower()
-                    ] = row["station_id"]
-
-        local_stations.sort(
-            key=lambda x: x.lower()
-        )
-
-        print(
-            f"Loaded {len(local_stations)} stations from local CSV"
-        )
-
-    except FileNotFoundError:
-        raise RuntimeError(
-            f"Station file not found: {STATIONS_FILE}"
-        )
 def load_network():
 
     global metro_graph
     global station_names
     global station_lookup
 
+    # Already available in memory
     if metro_graph is not None:
         return
 
-    conn = get_connection()
-    cursor = conn.cursor()
+    with _network_lock:
 
-    cursor.execute("""
-        SELECT
-            from_station_id,
-            from_station_name,
-            to_station_id,
-            to_station_name,
-            metro_line,
-            travel_time_minutes
-        FROM workspace.metroflow_gold.gold_route_serving
-    """)
+        # Double-check after acquiring lock
+        if metro_graph is not None:
+            return
 
-    rows = cursor.fetchall()
+        print(
+            "Loading route network from Databricks..."
+        )
 
-    cursor.close()
-    conn.close()
+        query = """
+            SELECT
+                from_station_id,
+                from_station_name,
+                to_station_id,
+                to_station_name,
+                metro_line,
+                travel_time_minutes
+            FROM workspace.metroflow_gold.gold_route_serving
+        """
 
-    metro_graph = {}
-    station_names = {}
+        rows = execute_databricks_query(query)
 
-    for row in rows:
+        graph = {}
+        names = {}
 
-        from_id = str(row[0])
-        from_name = row[1]
+        for row in rows:
 
-        to_id = str(row[2])
-        to_name = row[3]
+            from_id = str(row[0])
+            from_name = row[1]
 
-        metro_line = row[4]
-        travel_time = float(row[5])
+            to_id = str(row[2])
+            to_name = row[3]
 
-        station_names[from_id] = from_name
-        station_names[to_id] = to_name
+            metro_line = row[4]
+            travel_time = float(row[5])
 
-        if from_id not in metro_graph:
-            metro_graph[from_id] = []
+            names[from_id] = from_name
+            names[to_id] = to_name
 
-        metro_graph[from_id].append({
-            "station_id": to_id,
-            "station_name": to_name,
-            "metro_line": metro_line,
-            "travel_time": travel_time
-        })
+            if from_id not in graph:
+                graph[from_id] = []
 
-    station_lookup = {
-        name.strip().lower(): station_id
-        for station_id, name in station_names.items()
-    }
+            graph[from_id].append({
+                "station_id": to_id,
+                "station_name": to_name,
+                "metro_line": metro_line,
+                "travel_time": travel_time
+            })
+
+        # Make sure destination-only stations exist
+        for station_id in names:
+            if station_id not in graph:
+                graph[station_id] = []
+
+        lookup = {
+            name.strip().lower(): station_id
+            for station_id, name in names.items()
+            if name
+        }
+
+        # Assign only after successful complete load
+        metro_graph = graph
+        station_names = names
+        station_lookup = lookup
+
+        print(
+            f"Route network loaded successfully: "
+            f"{len(station_names)} stations"
+        )
 
 
 # ============================================================
@@ -176,6 +306,12 @@ def calculate_route(
 
     if blocked_edges is None:
         blocked_edges = set()
+
+    if source not in metro_graph:
+        return None
+
+    if destination not in metro_graph:
+        return None
 
     distances = {
         station_id: float("inf")
@@ -195,17 +331,23 @@ def calculate_route(
 
     while priority_queue:
 
-        current_distance, current_station = heapq.heappop(
-            priority_queue
+        current_distance, current_station = (
+            heapq.heappop(priority_queue)
         )
 
-        if current_distance > distances[current_station]:
+        if (
+            current_distance
+            > distances[current_station]
+        ):
             continue
 
         if current_station == destination:
             break
 
-        for edge in metro_graph.get(current_station, []):
+        for edge in metro_graph.get(
+            current_station,
+            []
+        ):
 
             next_station = edge["station_id"]
             metro_line = edge["metro_line"]
@@ -224,9 +366,14 @@ def calculate_route(
                 + edge["travel_time"]
             )
 
-            if new_distance < distances[next_station]:
+            if (
+                new_distance
+                < distances[next_station]
+            ):
 
-                distances[next_station] = new_distance
+                distances[next_station] = (
+                    new_distance
+                )
 
                 previous[next_station] = {
                     "station_id": current_station,
@@ -241,12 +388,12 @@ def calculate_route(
                     )
                 )
 
-    # No route
+    # No route found
     if distances[destination] == float("inf"):
         return None
 
     # --------------------------------------------------------
-    # Reconstruct station path
+    # Reconstruct path
     # --------------------------------------------------------
 
     route_ids = []
@@ -260,26 +407,26 @@ def calculate_route(
         if previous[current] is None:
             break
 
-        current = previous[current]["station_id"]
+        current = previous[current][
+            "station_id"
+        ]
 
     route_ids.reverse()
 
     # --------------------------------------------------------
-    # Build station-by-station line information
+    # Build station details
     # --------------------------------------------------------
 
     station_details = []
-
     current_line = None
 
     for i, station_id in enumerate(route_ids):
 
-        station_name = station_names[station_id]
+        station_name = station_names[
+            station_id
+        ]
 
-        # ----------------------------------------------------
         # Last station
-        # ----------------------------------------------------
-
         if i == len(route_ids) - 1:
 
             station_details.append({
@@ -295,13 +442,9 @@ def calculate_route(
 
         next_station = route_ids[i + 1]
 
-        previous_info = previous[next_station]
-
-        line = previous_info["metro_line"]
-
-        # ----------------------------------------------------
-        # Detect interchange
-        # ----------------------------------------------------
+        line = previous[next_station][
+            "metro_line"
+        ]
 
         is_interchange = (
             current_line is not None
@@ -314,13 +457,17 @@ def calculate_route(
             "line": line,
             "is_interchange": is_interchange,
             "from_line": current_line,
-            "to_line": line if is_interchange else None
+            "to_line": (
+                line
+                if is_interchange
+                else None
+            )
         })
 
         current_line = line
 
     # --------------------------------------------------------
-    # Unique metro lines
+    # Unique lines
     # --------------------------------------------------------
 
     lines = []
@@ -332,19 +479,11 @@ def calculate_route(
         if line and line not in lines:
             lines.append(line)
 
-    # --------------------------------------------------------
-    # Interchange count
-    # --------------------------------------------------------
-
     interchange_count = sum(
         1
         for station in station_details
         if station["is_interchange"]
     )
-
-    # --------------------------------------------------------
-    # Edge line sequence
-    # --------------------------------------------------------
 
     edge_lines = [
         station["line"]
@@ -397,19 +536,31 @@ def find_multiple_routes(
 
         raise HTTPException(
             status_code=404,
-            detail=f"Source station not found: {source_name}"
+            detail=(
+                f"Source station not found: "
+                f"{source_name}"
+            )
         )
 
     if destination is None:
 
         raise HTTPException(
             status_code=404,
-            detail=f"Destination station not found: {destination_name}"
+            detail=(
+                f"Destination station not found: "
+                f"{destination_name}"
+            )
         )
 
-    # --------------------------------------------------------
-    # Main shortest route
-    # --------------------------------------------------------
+    if source == destination:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Source and destination "
+                "cannot be the same"
+            )
+        )
 
     main_route = calculate_route(
         source,
@@ -423,18 +574,18 @@ def find_multiple_routes(
             detail="No route found"
         )
 
-    candidates = [
-        main_route
-    ]
-
-    # --------------------------------------------------------
-    # Generate alternatives
-    # --------------------------------------------------------
+    candidates = [main_route]
 
     main_ids = main_route["station_ids"]
     main_lines = main_route["edge_lines"]
 
-    for i in range(len(main_ids) - 1):
+    # Generate alternative routes
+    for i in range(
+        min(
+            len(main_ids) - 1,
+            len(main_lines)
+        )
+    ):
 
         blocked_edge = {
             (
@@ -454,7 +605,9 @@ def find_multiple_routes(
             continue
 
         existing_routes = {
-            tuple(route["station_ids"])
+            tuple(
+                route["station_ids"]
+            )
             for route in candidates
         }
 
@@ -462,11 +615,11 @@ def find_multiple_routes(
             alternative["station_ids"]
         )
 
-        if alternative_key not in existing_routes:
-
-            candidates.append(
-                alternative
-            )
+        if (
+            alternative_key
+            not in existing_routes
+        ):
+            candidates.append(alternative)
 
         if len(candidates) >= 3:
             break
@@ -478,60 +631,84 @@ def find_multiple_routes(
 # CROWD DATA CACHE
 # ============================================================
 
-# The serving table is small (~5K rows), so load it once and filter
-# in memory instead of opening a Databricks connection for each route.
-# Cache refreshes every 5 minutes.
 CROWD_CACHE_TTL_SECONDS = 300
+
 _crowd_cache = None
 _crowd_cache_loaded_at = 0.0
+
 _crowd_cache_lock = Lock()
 
 
-def load_crowd_cache(force_refresh=False):
-    global _crowd_cache, _crowd_cache_loaded_at
+def load_crowd_cache(
+    force_refresh=False
+):
+
+    global _crowd_cache
+    global _crowd_cache_loaded_at
 
     now = time.monotonic()
+
     cache_is_fresh = (
         _crowd_cache is not None
-        and now - _crowd_cache_loaded_at < CROWD_CACHE_TTL_SECONDS
+        and (
+            now - _crowd_cache_loaded_at
+            < CROWD_CACHE_TTL_SECONDS
+        )
     )
-    if cache_is_fresh and not force_refresh:
+
+    if (
+        cache_is_fresh
+        and not force_refresh
+    ):
         return _crowd_cache
 
     with _crowd_cache_lock:
+
         now = time.monotonic()
+
         cache_is_fresh = (
             _crowd_cache is not None
-            and now - _crowd_cache_loaded_at < CROWD_CACHE_TTL_SECONDS
+            and (
+                now - _crowd_cache_loaded_at
+                < CROWD_CACHE_TTL_SECONDS
+            )
         )
-        if cache_is_fresh and not force_refresh:
+
+        if (
+            cache_is_fresh
+            and not force_refresh
+        ):
             return _crowd_cache
 
-        conn = get_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("""
-                SELECT
-                    station_id,
-                    station_name,
-                    hour,
-                    scheduled_train_visits,
-                    activity_level,
-                    crowd_score,
-                    crowd_level,
-                    seat_likelihood_pct
-                FROM workspace.metroflow_gold.gold_crowd_serving
-            """)
-            rows = cursor.fetchall()
-        finally:
-            cursor.close()
-            conn.close()
+        print(
+            "Loading crowd data from Databricks..."
+        )
+
+        query = """
+            SELECT
+                station_id,
+                station_name,
+                hour,
+                scheduled_train_visits,
+                activity_level,
+                crowd_score,
+                crowd_level,
+                seat_likelihood_pct
+            FROM workspace.metroflow_gold.gold_crowd_serving
+        """
+
+        rows = execute_databricks_query(query)
 
         cache = {}
+
         for row in rows:
+
             station_id = str(row[0])
             hour = int(row[2])
-            cache[(station_id, hour)] = {
+
+            cache[
+                (station_id, hour)
+            ] = {
                 "station_id": station_id,
                 "station_name": row[1],
                 "hour": hour,
@@ -539,27 +716,53 @@ def load_crowd_cache(force_refresh=False):
                 "activity_level": row[4],
                 "crowd_score": float(row[5]),
                 "crowd_level": row[6],
-                "estimated_seat_likelihood_pct": float(row[7]),
+                "estimated_seat_likelihood_pct":
+                    float(row[7])
             }
 
+        # Only replace cache after successful load
         _crowd_cache = cache
-        _crowd_cache_loaded_at = time.monotonic()
+
+        _crowd_cache_loaded_at = (
+            time.monotonic()
+        )
+
+        print(
+            f"Crowd cache loaded: "
+            f"{len(cache)} records"
+        )
+
         return _crowd_cache
 
 
-def get_crowd_for_route(station_ids, departure_hour):
+def get_crowd_for_route(
+    station_ids,
+    departure_hour
+):
+
     if not station_ids:
         return []
 
     cache = load_crowd_cache()
-    # Preserve the route's station order for predictable API responses.
+
     result = []
     seen = set()
+
     for station_id in station_ids:
-        key = (str(station_id), int(departure_hour))
+
+        key = (
+            str(station_id),
+            int(departure_hour)
+        )
+
         if key in cache and key not in seen:
-            result.append(cache[key])
+
+            result.append(
+                cache[key]
+            )
+
             seen.add(key)
+
     return result
 
 
@@ -570,10 +773,13 @@ def get_crowd_for_route(station_ids, departure_hour):
 def calculate_crowd_summary(crowd_data):
 
     if not crowd_data:
+
         return {
             "average_crowd_score": None,
-            "average_estimated_seat_likelihood_pct": None,
-            "worst_estimated_seat_likelihood_pct": None,
+            "average_estimated_seat_likelihood_pct":
+                None,
+            "worst_estimated_seat_likelihood_pct":
+                None,
             "worst_station_name": None,
             "maximum_crowd_score": None
         }
@@ -584,26 +790,31 @@ def calculate_crowd_summary(crowd_data):
     ]
 
     seat_values = [
-        x["estimated_seat_likelihood_pct"]
+        x[
+            "estimated_seat_likelihood_pct"
+        ]
         for x in crowd_data
     ]
 
-    # Station with lowest estimated seat likelihood
     worst_station = min(
         crowd_data,
-        key=lambda x: x["estimated_seat_likelihood_pct"]
+        key=lambda x:
+            x[
+                "estimated_seat_likelihood_pct"
+            ]
     )
 
     return {
-        "average_crowd_score":
-            round(
-                sum(crowd_scores) / len(crowd_scores),
-                2
-            ),
+        "average_crowd_score": round(
+            sum(crowd_scores)
+            / len(crowd_scores),
+            2
+        ),
 
         "average_estimated_seat_likelihood_pct":
             round(
-                sum(seat_values) / len(seat_values),
+                sum(seat_values)
+                / len(seat_values),
                 2
             ),
 
@@ -616,7 +827,9 @@ def calculate_crowd_summary(crowd_data):
             ),
 
         "worst_station_name":
-            worst_station["station_name"],
+            worst_station[
+                "station_name"
+            ],
 
         "maximum_crowd_score":
             round(
@@ -630,15 +843,9 @@ def calculate_crowd_summary(crowd_data):
 # ROUTE SCORE
 # ============================================================
 
-def calculate_route_score(
-    route
-):
+def calculate_route_score(route):
 
     crowd = route["crowd_summary"]
-
-    travel_time = route[
-        "travel_time_minutes"
-    ]
 
     average_crowd = crowd[
         "average_crowd_score"
@@ -648,12 +855,16 @@ def calculate_route_score(
         "average_estimated_seat_likelihood_pct"
     ]
 
+    if average_crowd is None:
+        return 0
+
+    travel_time = route[
+        "travel_time_minutes"
+    ]
+
     interchanges = route[
         "interchange_count"
     ]
-
-    if average_crowd is None:
-        return 0
 
     time_score = max(
         0,
@@ -678,10 +889,7 @@ def calculate_route_score(
         + (interchange_score * 0.15)
     )
 
-    return round(
-        score,
-        2
-    )
+    return round(score, 2)
 
 
 # ============================================================
@@ -694,30 +902,44 @@ def parse_departure_time(
 
     try:
 
-        hour, minute = departure_time.split(":")
+        hour, minute = (
+            departure_time.split(":")
+        )
 
         hour = int(hour)
         minute = int(minute)
 
-    except ValueError:
+    except (
+        ValueError,
+        AttributeError
+    ):
 
         raise HTTPException(
             status_code=400,
-            detail="Departure time must be HH:MM"
+            detail=(
+                "Departure time must "
+                "be in HH:MM format"
+            )
         )
 
     if hour < 0 or hour > 23:
 
         raise HTTPException(
             status_code=400,
-            detail="Hour must be between 00 and 23"
+            detail=(
+                "Hour must be "
+                "between 00 and 23"
+            )
         )
 
     if minute < 0 or minute > 59:
 
         raise HTTPException(
             status_code=400,
-            detail="Minute must be between 00 and 59"
+            detail=(
+                "Minute must be "
+                "between 00 and 59"
+            )
         )
 
     return hour, minute
@@ -732,53 +954,94 @@ def label_routes(routes):
     if not routes:
         return routes
 
-    # --------------------------------------------------------
-    # FASTEST
-    # --------------------------------------------------------
-
     fastest = min(
         routes,
         key=lambda x:
-        x["travel_time_minutes"]
+            x["travel_time_minutes"]
     )
-
-    # --------------------------------------------------------
-    # COMFORTABLE
-    # Lowest crowd
-    # --------------------------------------------------------
 
     comfortable = min(
         routes,
         key=lambda x:
-        x["crowd_summary"]["average_crowd_score"]
-        if x["crowd_summary"]["average_crowd_score"]
-        is not None
-        else 999
+            x["crowd_summary"][
+                "average_crowd_score"
+            ]
+            if x["crowd_summary"][
+                "average_crowd_score"
+            ] is not None
+            else float("inf")
     )
-
-    # --------------------------------------------------------
-    # BALANCED
-    # Highest trade-off score
-    # --------------------------------------------------------
 
     balanced = max(
         routes,
         key=lambda x:
-        x["route_score"]
+            x["route_score"]
     )
-
-    # --------------------------------------------------------
-    # Reset labels
-    # --------------------------------------------------------
 
     for route in routes:
         route["type"] = "ALTERNATIVE"
 
     fastest["type"] = "FASTEST"
     comfortable["type"] = "COMFORTABLE"
-    balanced["type"] = "BALANCED"
+
+    # Don't overwrite FASTEST/COMFORTABLE
+    # unnecessarily when routes overlap.
+    if balanced["type"] == "ALTERNATIVE":
+        balanced["type"] = "BALANCED"
 
     return routes
+
+
+# ============================================================
+# BACKGROUND WARM-UP
+# ============================================================
+
+def warm_up_databricks():
+
+    try:
+
+        print(
+            "Warming up route network..."
+        )
+
+        load_network()
+
+        print(
+            "Route network ready"
+        )
+
+        print(
+            "Warming up crowd cache..."
+        )
+
+        load_crowd_cache()
+
+        print(
+            "Crowd cache ready"
+        )
+
+    except Exception as e:
+
+        # Don't crash the API if Databricks
+        # is temporarily unavailable.
+        print(
+            f"Databricks warm-up failed: {e}"
+        )
+
+
+@app.on_event("startup")
+def startup_event():
+
+    # Stations are always available locally
+    load_local_stations()
+
+    # Databricks loads separately in background
+    thread = threading.Thread(
+        target=warm_up_databricks,
+        daemon=True
+    )
+
+    thread.start()
 
 
 # ============================================================
@@ -790,7 +1053,7 @@ def home():
 
     return {
         "message": "MetroFlow API is running",
-        "version": "1.0.0"
+        "version": "1.1.0"
     }
 
 
@@ -802,17 +1065,31 @@ def home():
 def health():
 
     return {
-        "status": "healthy"
+        "status": "healthy",
+        "stations_loaded": bool(
+            local_stations
+        ),
+        "network_loaded": (
+            metro_graph is not None
+        ),
+        "crowd_cache_loaded": (
+            _crowd_cache is not None
+        )
     }
+
+
+# ============================================================
+# STATIONS
+# ============================================================
 
 @app.get("/stations")
 def get_stations():
+
     load_local_stations()
 
     return {
         "stations": local_stations
     }
-
 
 
 # ============================================================
@@ -825,27 +1102,54 @@ def route(
     destination: str
 ):
 
-    routes = find_multiple_routes(
-        source,
-        destination
-    )
+    try:
 
-    result = routes[0]
+        routes = find_multiple_routes(
+            source,
+            destination
+        )
 
-    return {
-        "source": source,
-        "destination": destination,
-        "travel_time_minutes":
-            result["travel_time_minutes"],
-        "interchange_count":
-            result["interchange_count"],
-        "lines_used":
-            result["lines_used"],
-        "stations":
-            result["stations"],
-        "station_details":
-            result["station_details"]
-    }
+        result = routes[0]
+
+        return {
+            "source": source,
+            "destination": destination,
+            "travel_time_minutes":
+                result[
+                    "travel_time_minutes"
+                ],
+            "interchange_count":
+                result[
+                    "interchange_count"
+                ],
+            "lines_used":
+                result[
+                    "lines_used"
+                ],
+            "stations":
+                result["stations"],
+            "station_details":
+                result[
+                    "station_details"
+                ]
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print(
+            f"Route error: {e}"
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Route data is temporarily "
+                "unavailable. Please try again."
+            )
+        )
 
 
 # ============================================================
@@ -858,38 +1162,85 @@ def crowd(
     hour: int
 ):
 
-    if hour < 0 or hour > 25:
+    if hour < 0 or hour > 23:
+
         raise HTTPException(
             status_code=400,
-            detail="Hour must be between 0 and 25"
+            detail=(
+                "Hour must be "
+                "between 0 and 23"
+            )
         )
 
-    cache = load_crowd_cache()
-    station_key = station.strip().lower()
-    row = next(
-        (
-            item for item in cache.values()
-            if item["station_name"].strip().lower() == station_key
-            and item["hour"] == hour
-        ),
-        None
-    )
+    try:
 
-    if row is None:
+        cache = load_crowd_cache()
+
+        station_key = (
+            station.strip().lower()
+        )
+
+        row = next(
+            (
+                item
+                for item in cache.values()
+                if (
+                    item["station_name"]
+                    .strip()
+                    .lower()
+                    == station_key
+                    and item["hour"] == hour
+                )
+            ),
+            None
+        )
+
+        if row is None:
+
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Crowd data not found"
+                )
+            )
+
+        return {
+            "station":
+                row["station_name"],
+            "hour":
+                row["hour"],
+            "scheduled_train_visits":
+                row[
+                    "scheduled_train_visits"
+                ],
+            "activity_level":
+                row["activity_level"],
+            "crowd_score":
+                row["crowd_score"],
+            "crowd_level":
+                row["crowd_level"],
+            "estimated_seat_likelihood_pct":
+                row[
+                    "estimated_seat_likelihood_pct"
+                ]
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print(
+            f"Crowd error: {e}"
+        )
+
         raise HTTPException(
-            status_code=404,
-            detail="Crowd data not found"
+            status_code=503,
+            detail=(
+                "Crowd data is temporarily "
+                "unavailable. Please try again."
+            )
         )
-
-    return {
-        "station": row["station_name"],
-        "hour": row["hour"],
-        "scheduled_train_visits": row["scheduled_train_visits"],
-        "activity_level": row["activity_level"],
-        "crowd_score": row["crowd_score"],
-        "crowd_level": row["crowd_level"],
-        "estimated_seat_likelihood_pct": row["estimated_seat_likelihood_pct"]
-    }
 
 
 # ============================================================
@@ -903,136 +1254,145 @@ def plan(
     departure_time: str
 ):
 
-    # --------------------------------------------------------
-    # Parse time
-    # --------------------------------------------------------
+    try:
 
-    departure_hour, departure_minute = (
-        parse_departure_time(
-            departure_time
-        )
-    )
-
-    # --------------------------------------------------------
-    # Find routes
-    # --------------------------------------------------------
-
-    raw_routes = find_multiple_routes(
-        source,
-        destination
-    )
-
-    final_routes = []
-
-    # --------------------------------------------------------
-    # Crowd analysis
-    # --------------------------------------------------------
-
-    for route in raw_routes:
-
-        crowd_data = get_crowd_for_route(
-            route["station_ids"],
-            departure_hour
-        )
-
-        crowd_summary = calculate_crowd_summary(
-            crowd_data
-        )
-
-        route_result = {
-
-            "travel_time_minutes":
-                route["travel_time_minutes"],
-
-            "interchange_count":
-                route["interchange_count"],
-
-            "lines_used":
-                route["lines_used"],
-
-            "stations":
-                route["stations"],
-
-            "station_details":
-                route["station_details"],
-
-            "crowd_summary":
-                crowd_summary,
-
-            "station_crowd":
-                crowd_data
-        }
-
-        final_routes.append(
-            route_result
-        )
-
-    # --------------------------------------------------------
-    # Calculate trade-off score
-    # --------------------------------------------------------
-
-    for route in final_routes:
-
-        route["route_score"] = (
-            calculate_route_score(
-                route
+        # Parse time
+        departure_hour, departure_minute = (
+            parse_departure_time(
+                departure_time
             )
         )
 
-    # --------------------------------------------------------
-    # Label routes
-    # --------------------------------------------------------
-
-    final_routes = label_routes(
-        final_routes
-    )
-
-    # --------------------------------------------------------
-    # Sort routes
-    # --------------------------------------------------------
-
-    type_order = {
-        "FASTEST": 1,
-        "COMFORTABLE": 2,
-        "BALANCED": 3,
-        "ALTERNATIVE": 4
-    }
-
-    final_routes.sort(
-        key=lambda x:
-        type_order.get(
-            x["type"],
-            99
-        )
-    )
-
-    # --------------------------------------------------------
-    # Final response
-    # --------------------------------------------------------
-
-    return {
-
-        "source":
+        # Find routes from cached network
+        raw_routes = find_multiple_routes(
             source,
+            destination
+        )
 
-        "destination":
-            destination,
+        final_routes = []
 
-        "departure_time":
-            departure_time,
+        # Crowd analysis
+        for route in raw_routes:
 
-        "crowd_profile_hour":
-            departure_hour,
+            crowd_data = (
+                get_crowd_for_route(
+                    route["station_ids"],
+                    departure_hour
+                )
+            )
 
-        "routes":
-            final_routes,
+            crowd_summary = (
+                calculate_crowd_summary(
+                    crowd_data
+                )
+            )
 
-        "route_count":
-            len(final_routes),
+            route_result = {
 
-        "disclaimer":
-            "Crowd and seat values are modelled estimates "
-            "based on scheduled service activity and are "
-            "not real-time occupancy or guaranteed seat "
-            "availability."
-    }
+                "travel_time_minutes":
+                    route[
+                        "travel_time_minutes"
+                    ],
+
+                "interchange_count":
+                    route[
+                        "interchange_count"
+                    ],
+
+                "lines_used":
+                    route[
+                        "lines_used"
+                    ],
+
+                "stations":
+                    route["stations"],
+
+                "station_details":
+                    route[
+                        "station_details"
+                    ],
+
+                "crowd_summary":
+                    crowd_summary,
+
+                "station_crowd":
+                    crowd_data
+            }
+
+            final_routes.append(
+                route_result
+            )
+
+        # Calculate scores
+        for route in final_routes:
+
+            route["route_score"] = (
+                calculate_route_score(
+                    route
+                )
+            )
+
+        # Label routes
+        final_routes = label_routes(
+            final_routes
+        )
+
+        # Sort routes
+        type_order = {
+            "FASTEST": 1,
+            "COMFORTABLE": 2,
+            "BALANCED": 3,
+            "ALTERNATIVE": 4
+        }
+
+        final_routes.sort(
+            key=lambda x:
+                type_order.get(
+                    x["type"],
+                    99
+                )
+        )
+
+        return {
+
+            "source": source,
+
+            "destination": destination,
+
+            "departure_time":
+                departure_time,
+
+            "crowd_profile_hour":
+                departure_hour,
+
+            "routes":
+                final_routes,
+
+            "route_count":
+                len(final_routes),
+
+            "disclaimer":
+                "Crowd and seat values are "
+                "modelled estimates based on "
+                "scheduled service activity and "
+                "are not real-time occupancy or "
+                "guaranteed seat availability."
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print(
+            f"Plan error: {e}"
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Journey planning data is "
+                "temporarily unavailable. "
+                "Please try again."
+            )
+        )
