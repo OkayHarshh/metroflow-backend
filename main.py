@@ -2,6 +2,7 @@ import os
 import heapq
 import time
 from threading import Lock
+import csv
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,7 +51,56 @@ metro_graph = None
 station_names = None
 station_lookup = None
 
+# ============================================================
+# LOCAL STATION DATA
+# ============================================================
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIONS_FILE = os.path.join(BASE_DIR, "dim_station.csv")
+
+local_stations = []
+local_station_lookup = {}
+
+
+def load_local_stations():
+    global local_stations
+    global local_station_lookup
+
+    # Already loaded in memory
+    if local_stations:
+        return
+
+    try:
+        with open(
+            STATIONS_FILE,
+            mode="r",
+            encoding="utf-8-sig"
+        ) as file:
+
+            reader = csv.DictReader(file)
+
+            for row in reader:
+                station_name = row["station_name"].strip()
+
+                if station_name:
+                    local_stations.append(station_name)
+
+                    local_station_lookup[
+                        station_name.lower()
+                    ] = row["station_id"]
+
+        local_stations.sort(
+            key=lambda x: x.lower()
+        )
+
+        print(
+            f"Loaded {len(local_stations)} stations from local CSV"
+        )
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"Station file not found: {STATIONS_FILE}"
+        )
 def load_network():
 
     global metro_graph
@@ -757,15 +807,11 @@ def health():
 
 @app.get("/stations")
 def get_stations():
-    load_network()
+    load_local_stations()
 
     return {
-        "stations": sorted(
-            station_names.values(),
-            key=lambda x: x.lower()
-        )
+        "stations": local_stations
     }
-
 
 
 
