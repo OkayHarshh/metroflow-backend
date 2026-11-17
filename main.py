@@ -1151,10 +1151,66 @@ def route(
             )
         )
 
+# ============================================================
+# SEAT COMFORT HELPERS (used by /plan)
+# ============================================================
 
-# ============================================================
-# SINGLE STATION CROWD
-# ============================================================
+
+def get_seat_comfort_for_route(station_ids, departure_hour):
+    if not station_ids:
+        return []
+
+    try:
+        cache = load_seat_comfort_cache()
+    except Exception as e:
+        # Never let the new data break the existing /plan endpoint
+        print(f"Seat comfort unavailable for /plan: {e}")
+        return []
+
+    result = []
+    seen = set()
+
+    for station_id in station_ids:
+        key = (str(station_id), int(departure_hour))
+        if key in cache and key not in seen:
+            result.append(cache[key])
+            seen.add(key)
+
+    return result
+
+
+def calculate_seat_comfort_summary(seat_data, total_stations):
+    if not seat_data:
+        return {
+            "average_seat_comfort_score": None,
+            "worst_seat_comfort_score": None,
+            "worst_station_name": None,
+            "overall_level": None,
+            "stations_with_data": 0,
+            "stations_total": total_stations,
+        }
+
+    scores = [x["seat_comfort_score"] for x in seat_data]
+    worst = min(seat_data, key=lambda x: x["seat_comfort_score"])
+    average = sum(scores) / len(scores)
+
+    if average >= 65:
+        level = "LIKELY"
+    elif average >= 40:
+        level = "POSSIBLE"
+    else:
+        level = "UNLIKELY"
+
+    return {
+        "average_seat_comfort_score": round(average, 1),
+        "worst_seat_comfort_score": round(worst["seat_comfort_score"], 1),
+        "worst_station_name": worst["station_name"],
+        "overall_level": level,
+        "stations_with_data": len(seat_data),
+        "stations_total": total_stations,
+    }
+
+
 # ============================================================
 # SEAT COMFORT ESTIMATE (schedule-based heuristic)
 # ============================================================
@@ -1264,6 +1320,12 @@ def seat_comfort(station: str, hour: int):
         "seat_comfort_level": row["seat_comfort_level"],
         "basis": row["basis"],
     }
+
+
+# ============================================================
+# SINGLE STATION CROWD
+# ============================================================
+
 @app.get("/crowd")
 def crowd(
     station: str,
@@ -1395,6 +1457,16 @@ def plan(
                 )
             )
 
+            seat_data = get_seat_comfort_for_route(
+                route["station_ids"],
+                departure_hour
+            )
+
+            seat_comfort_summary = calculate_seat_comfort_summary(
+                seat_data,
+                len(route["station_ids"])
+            )
+
             route_result = {
 
                 "travel_time_minutes":
@@ -1424,7 +1496,13 @@ def plan(
                     crowd_summary,
 
                 "station_crowd":
-                    crowd_data
+                    crowd_data,
+
+                "seat_comfort_summary":
+                    seat_comfort_summary,
+
+                "station_seat_comfort":
+                    seat_data
             }
 
             final_routes.append(
