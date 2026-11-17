@@ -1155,7 +1155,115 @@ def route(
 # ============================================================
 # SINGLE STATION CROWD
 # ============================================================
+# ============================================================
+# SEAT COMFORT ESTIMATE (schedule-based heuristic)
+# ============================================================
 
+SEAT_COMFORT_CACHE_TTL_SECONDS = 300
+_seat_comfort_cache = None
+_seat_comfort_cache_loaded_at = 0.0
+_seat_comfort_cache_lock = Lock()
+
+
+def load_seat_comfort_cache(force_refresh=False):
+    global _seat_comfort_cache
+    global _seat_comfort_cache_loaded_at
+
+    def is_fresh():
+        return (
+            _seat_comfort_cache is not None
+            and (
+                time.monotonic() - _seat_comfort_cache_loaded_at
+                < SEAT_COMFORT_CACHE_TTL_SECONDS
+            )
+        )
+
+    if is_fresh() and not force_refresh:
+        return _seat_comfort_cache
+
+    with _seat_comfort_cache_lock:
+        if is_fresh() and not force_refresh:
+            return _seat_comfort_cache
+
+        print("Loading seat comfort data from Databricks...")
+
+        rows = execute_databricks_query("""
+            SELECT
+                station_id,
+                station_name,
+                hour,
+                scheduled_train_visits,
+                line_count,
+                seat_comfort_score,
+                seat_comfort_level,
+                basis
+            FROM workspace.metroflow_gold.gold_seat_comfort_serving
+        """)
+
+        cache = {}
+        for row in rows:
+            station_id = str(row[0])
+            hour = int(row[2])
+            cache[(station_id, hour)] = {
+                "station_id": station_id,
+                "station_name": row[1],
+                "hour": hour,
+                "scheduled_train_visits": row[3],
+                "line_count": row[4],
+                "seat_comfort_score": float(row[5]),
+                "seat_comfort_level": row[6],
+                "basis": row[7],
+            }
+
+        # Replace the cache only after a successful load
+        _seat_comfort_cache = cache
+        _seat_comfort_cache_loaded_at = time.monotonic()
+        print(f"Seat comfort cache loaded: {len(cache)} records")
+        return _seat_comfort_cache
+
+
+@app.get("/seat-comfort")
+def seat_comfort(station: str, hour: int):
+    if hour < 0 or hour > 23:
+        raise HTTPException(
+            status_code=400,
+            detail="Hour must be between 0 and 23"
+        )
+
+    try:
+        cache = load_seat_comfort_cache()
+        station_key = station.strip().lower()
+
+        row = next(
+            (
+                item for item in cache.values()
+                if item["station_name"].strip().lower() == station_key
+                and item["hour"] == hour
+            ),
+            None
+        )
+    except Exception as e:
+        print(f"Seat comfort error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Seat comfort data is temporarily unavailable. Please try again."
+        )
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No scheduled weekday service found for this station at this hour"
+        )
+
+    return {
+        "station": row["station_name"],
+        "hour": row["hour"],
+        "scheduled_train_visits": row["scheduled_train_visits"],
+        "line_count": row["line_count"],
+        "seat_comfort_score": row["seat_comfort_score"],
+        "seat_comfort_level": row["seat_comfort_level"],
+        "basis": row["basis"],
+    }
 @app.get("/crowd")
 def crowd(
     station: str,
