@@ -845,6 +845,22 @@ def calculate_crowd_summary(crowd_data):
 
 def calculate_route_score(route):
 
+    # Seat comfort (schedule-based heuristic) is the main comfort signal.
+    seat_summary = route.get("seat_comfort_summary") or {}
+    average_comfort = seat_summary.get("average_seat_comfort_score")
+
+    if average_comfort is not None:
+        time_score = max(0, 100 - (route["travel_time_minutes"] * 2))
+        interchange_score = max(0, 100 - (route["interchange_count"] * 25))
+        return round(
+            (time_score * 0.30)
+            + (average_comfort * 0.55)
+            + (interchange_score * 0.15),
+            2
+        )
+
+    # Fallback: old crowd-based score if seat comfort data is unavailable
+
     crowd = route["crowd_summary"]
 
     average_crowd = crowd[
@@ -960,17 +976,34 @@ def label_routes(routes):
             x["travel_time_minutes"]
     )
 
-    comfortable = min(
-        routes,
-        key=lambda x:
-            x["crowd_summary"][
-                "average_crowd_score"
-            ]
-            if x["crowd_summary"][
-                "average_crowd_score"
-            ] is not None
-            else float("inf")
+    have_seat_comfort = all(
+        (x.get("seat_comfort_summary") or {}).get(
+            "average_seat_comfort_score"
+        ) is not None
+        for x in routes
     )
+
+    if have_seat_comfort:
+        comfortable = max(
+            routes,
+            key=lambda x:
+                x["seat_comfort_summary"][
+                    "average_seat_comfort_score"
+                ]
+        )
+    else:
+        # Fallback: old crowd-based choice
+        comfortable = min(
+            routes,
+            key=lambda x:
+                x["crowd_summary"][
+                    "average_crowd_score"
+                ]
+                if x["crowd_summary"][
+                    "average_crowd_score"
+                ] is not None
+                else float("inf")
+        )
 
     balanced = max(
         routes,
@@ -1558,11 +1591,10 @@ def plan(
                 len(final_routes),
 
             "disclaimer":
-                "Crowd and seat values are "
-                "modelled estimates based on "
-                "scheduled service activity and "
-                "are not real-time occupancy or "
-                "guaranteed seat availability."
+                "Seat comfort is a schedule-based "
+                "estimate built from the weekday "
+                "timetable. It is not live passenger "
+                "data and does not guarantee a seat."
         }
 
     except HTTPException:
